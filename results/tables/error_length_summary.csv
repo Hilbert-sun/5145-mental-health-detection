@@ -1,0 +1,4 @@
+"error_type","count","median_word_count","mean_word_count"
+"Correct",6188,144,199.23
+"False Negative",304,149.5,236.08
+"False Positive",365,131,163.84

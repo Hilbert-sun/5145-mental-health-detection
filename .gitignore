@@ -1,0 +1,25 @@
+# R temporary files
+.Rhistory
+.RData
+.RDataTmp
+.Rproj.user/
+
+# R Markdown cache and generated files
+*_cache/
+*_files/
+*.log
+*.tmp
+
+# Raw and sensitive data
+data/raw/
+data/processed/data_clean_full.csv
+
+# Trained model files
+results/models/*.rds
+
+# Optional: large generated HTML files
+# notebooks/*.html
+
+# System files
+.DS_Store
+Thumbs.db

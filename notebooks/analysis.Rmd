@@ -1,0 +1,1155 @@
+---
+title:"R Demonstration: Interpretable Machine Learning for Reddit Mental Health Text"
+author: "SUN ZHEN"
+date: "2026-05-11"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+```
+```{r project-paths}
+# Find the project root by looking for the main project folders
+find_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, mustWork = TRUE)
+  
+  repeat {
+    required_dirs <- c("data", "notebooks", "results", "src")
+    
+    if (all(dir.exists(file.path(current, required_dirs)))) {
+      return(current)
+    }
+    
+    parent <- dirname(current)
+    
+    if (identical(parent, current)) {
+      stop("Project root could not be found. Please check your folder structure.")
+    }
+    
+    current <- parent
+  }
+}
+
+# Project root
+project_root <- find_project_root()
+
+# Define project folders
+data_raw_dir <- file.path(project_root, "data", "raw")
+data_processed_dir <- file.path(project_root, "data", "processed")
+
+figures_dir <- file.path(project_root, "results", "figures")
+tables_dir <- file.path(project_root, "results", "tables")
+models_dir <- file.path(project_root, "results", "models")
+
+# Create folders if they do not already exist
+dir.create(data_raw_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(data_processed_dir, recursive = TRUE, showWarnings = FALSE)
+
+dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(models_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Show paths for checking
+data.frame(
+  Folder = c(
+    "Project root",
+    "Raw data",
+    "Processed data",
+    "Figures",
+    "Tables",
+    "Models"
+  ),
+  Path = c(
+    project_root,
+    data_raw_dir,
+    data_processed_dir,
+    figures_dir,
+    tables_dir,
+    models_dir
+  )
+)
+```
+```{r save-figure-helper}
+save_figure <- function(plot_object, file_name, width = 8, height = 5, dpi = 300) {
+  ggsave(
+    filename = file.path(figures_dir, file_name),
+    plot = plot_object,
+    width = width,
+    height = height,
+    dpi = dpi
+  )
+}
+```
+## Introduction
+
+This project aims to detect depression-related posts from Reddit using natural language processing and machine learning techniques.
+
+---
+
+## Load Data
+
+This section loads two Reddit mental health datasets: depression-related posts and ADHD-related posts. The depression dataset is treated as the target class, while the ADHD dataset is used as a comparison group.
+
+```{r load-data}
+# Helper function to make file paths more reproducible
+find_file <- function(filename) {
+  candidate_paths <- c(
+    filename,
+    file.path("data", filename),
+    file.path("..", "data", filename)
+  )
+  
+  existing_paths <- candidate_paths[file.exists(candidate_paths)]
+  
+  if (length(existing_paths) == 0) {
+    stop(paste("Cannot find file:", filename))
+  }
+  
+  existing_paths[1]
+}
+
+# Load data
+depression <- read.csv(find_file("depression.csv"), stringsAsFactors = FALSE)
+adhd <- read.csv(find_file("adhd.csv"), stringsAsFactors = FALSE)
+
+# Check dataset dimensions without displaying sensitive raw posts
+data.frame(
+  Dataset = c("Depression", "ADHD"),
+  Rows = c(nrow(depression), nrow(adhd)),
+  Columns = c(ncol(depression), ncol(adhd))
+)
+```
+
+## Data Preprocessing
+
+The raw datasets contain Reddit post titles, post bodies, metadata, and subreddit labels. For this project, the title and body fields are combined to create a single text field. Posts marked as `[removed]` or `[deleted]` are excluded because they do not contain meaningful textual information for analysis.
+
+```{r data-preprocessing}
+# Check required columns
+required_columns <- c("title", "body")
+
+if (!all(required_columns %in% names(depression))) {
+  stop("The depression dataset does not contain the required columns: title and body.")
+}
+
+if (!all(required_columns %in% names(adhd))) {
+  stop("The ADHD dataset does not contain the required columns: title and body.")
+}
+
+# Create text and label fields
+depression$text_raw <- paste(
+  ifelse(is.na(depression$title), "", depression$title),
+  ifelse(is.na(depression$body), "", depression$body)
+)
+
+adhd$text_raw <- paste(
+  ifelse(is.na(adhd$title), "", adhd$title),
+  ifelse(is.na(adhd$body), "", adhd$body)
+)
+
+# Label: 1 = depression-related posts, 0 = ADHD-related comparison posts
+depression$label <- 1
+adhd$label <- 0
+
+# Keep only variables needed for analysis
+depression_selected <- depression[, c("text_raw", "label")]
+adhd_selected <- adhd[, c("text_raw", "label")]
+
+# Merge datasets
+data_raw <- rbind(depression_selected, adhd_selected)
+
+# Record initial dataset size
+initial_n <- nrow(data_raw)
+
+# Identify invalid posts
+removed_or_deleted <- grepl("\\[removed\\]|\\[deleted\\]", data_raw$text_raw, ignore.case = TRUE)
+empty_text <- is.na(data_raw$text_raw) | trimws(data_raw$text_raw) == ""
+
+# Remove invalid posts
+data_clean <- data_raw[!removed_or_deleted & !empty_text, ]
+
+# Create a cleaning summary table
+cleaning_summary <- data.frame(
+  Stage = c(
+    "Initial merged dataset",
+    "Removed/deleted posts",
+    "Empty or missing text",
+    "Final cleaned dataset"
+  ),
+  Count = c(
+    initial_n,
+    sum(removed_or_deleted),
+    sum(empty_text),
+    nrow(data_clean)
+  )
+)
+
+cleaning_summary
+```
+
+The cleaning process removes posts that do not contain meaningful text. This is important because deleted or removed Reddit posts would introduce noise into word frequency analysis and machine learning models.
+
+## Exploratory Data Analysis
+
+This section examines the basic characteristics of the cleaned dataset, including class distribution and text length. These exploratory results help assess whether the dataset is suitable for text classification.
+
+### Class Distribution
+
+```{r class-distribution}
+library(ggplot2)
+
+# Convert numeric labels into meaningful class names
+data_clean$class <- ifelse(
+  data_clean$label == 1,
+  "Depression-related posts",
+  "ADHD comparison posts"
+)
+
+# Create class distribution summary
+class_distribution <- as.data.frame(table(data_clean$class))
+colnames(class_distribution) <- c("Class", "Count")
+
+class_distribution$Percentage <- round(
+  class_distribution$Count / sum(class_distribution$Count) * 100,
+  2
+)
+
+class_distribution
+```
+
+```{r class-distribution-plot}
+p_class_distribution <- ggplot(class_distribution, aes(x = Class, y = Count)) +
+  geom_col() +
+  geom_text(
+    aes(label = paste0(Count, " (", Percentage, "%)")),
+    vjust = -0.4,
+    size = 3.5
+  ) +
+  labs(
+    title = "Class Distribution After Data Cleaning",
+    x = "Post Category",
+    y = "Number of Posts"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 15, hjust = 1)
+  )
+
+p_class_distribution
+
+save_figure(
+  p_class_distribution,
+  "class_distribution.png",
+  width = 8,
+  height = 5
+)
+```
+
+The cleaned dataset contains posts from both depression-related and ADHD-related Reddit communities. The ADHD posts are used as a comparison group, while depression-related posts are treated as the target class. The class distribution is moderately imbalanced, so model evaluation should consider not only accuracy but also precision, recall, and F1-score.
+
+### Text Length Distribution
+
+Text length is an important characteristic of social media data because very short posts may contain limited linguistic information, while very long posts may introduce extreme values and noise. This section compares the word counts of ADHD comparison posts and depression-related posts.
+
+```{r text-length-summary}
+# Calculate text length
+data_clean$char_count <- nchar(data_clean$text_raw)
+
+data_clean$word_count <- sapply(
+  strsplit(trimws(data_clean$text_raw), "\\s+"),
+  length
+)
+
+# Summary statistics by class
+text_length_summary <- do.call(
+  rbind,
+  lapply(split(data_clean$word_count, data_clean$class), function(x) {
+    data.frame(
+      Count = length(x),
+      Min = min(x),
+      Q1 = as.numeric(quantile(x, 0.25)),
+      Median = median(x),
+      Mean = round(mean(x), 2),
+      Q3 = as.numeric(quantile(x, 0.75)),
+      Max = max(x)
+    )
+  })
+)
+
+text_length_summary$Class <- rownames(text_length_summary)
+rownames(text_length_summary) <- NULL
+
+text_length_summary <- text_length_summary[
+  , c("Class", "Count", "Min", "Q1", "Median", "Mean", "Q3", "Max")
+]
+
+text_length_summary
+```
+```{r save-cleaned-data}
+# Ensure required fields exist before saving
+if (!"class" %in% names(data_clean)) {
+  data_clean$class <- ifelse(
+    data_clean$label == 1,
+    "Depression-related posts",
+    "ADHD comparison posts"
+  )
+}
+
+if (!"char_count" %in% names(data_clean)) {
+  data_clean$char_count <- nchar(data_clean$text_raw)
+}
+
+if (!"word_count" %in% names(data_clean)) {
+  data_clean$word_count <- sapply(
+    strsplit(trimws(data_clean$text_raw), "\\s+"),
+    length
+  )
+}
+
+# Save the full cleaned dataset locally
+write.csv(
+  data_clean,
+  file.path(data_processed_dir, "data_clean_full.csv"),
+  row.names = FALSE
+)
+
+# Save a privacy-safer metadata version for GitHub
+safe_columns <- intersect(
+  c("label", "class", "char_count", "word_count"),
+  names(data_clean)
+)
+
+data_clean_safe <- data_clean[, safe_columns]
+
+write.csv(
+  data_clean_safe,
+  file.path(data_processed_dir, "data_clean_safe_metadata.csv"),
+  row.names = FALSE
+)
+
+data.frame(
+  File = c(
+    "data_clean_full.csv",
+    "data_clean_safe_metadata.csv"
+  ),
+  Rows = c(
+    nrow(data_clean),
+    nrow(data_clean_safe)
+  ),
+  Columns = c(
+    ncol(data_clean),
+    ncol(data_clean_safe)
+  )
+)
+```
+
+```{r text-length-boxplot}
+ggplot(data_clean, aes(x = class, y = word_count)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(
+    title = "Word Count Distribution by Post Category",
+    x = "Post Category",
+    y = "Word Count"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 15, hjust = 1)
+  )
+```
+
+```{r text-length-boxplot-log}
+p_text_length_log <- ggplot(data_clean, aes(x = class, y = word_count)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  scale_y_log10() +
+  labs(
+    title = "Word Count Distribution by Post Category (Log Scale)",
+    x = "Post Category",
+    y = "Word Count (log scale)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 15, hjust = 1)
+  )
+
+p_text_length_log
+
+save_figure(
+  p_text_length_log,
+  "text_length_log_boxplot.png",
+  width = 8,
+  height = 5
+)
+```
+
+The word count distribution helps assess whether the two post categories differ in writing style or post length. Because social media text often contains extreme values, the log-scale plot provides a clearer view of the central distribution while still preserving the effect of longer posts.
+
+### Word Frequency Analysis by Class
+
+Word frequency analysis helps identify common linguistic patterns in each category. To make the results more informative, this section removes standard stop words, common contractions, numbers, and obvious label-specific words such as "adhd" and "depression". This reduces the risk that the analysis is dominated by direct subreddit labels rather than broader linguistic patterns.
+
+```{r word-frequency-preparation}
+library(dplyr)
+library(tidytext)
+library(stringr)
+
+# Create a document ID for tokenisation
+data_clean$doc_id <- seq_len(nrow(data_clean))
+
+# Custom stop words for Reddit-style text and obvious label words
+custom_stop_words <- data.frame(
+  word = c(
+    "im", "ive", "id", "ill", "youre", "youve", "youll",
+    "dont", "doesnt", "didnt", "cant", "couldnt", "wouldnt",
+    "shouldnt", "isnt", "arent", "wasnt", "werent",
+    "thats", "theres", "whats", "wont", "itll", "its",
+    "adhd", "depression", "depressed", "depressive"
+  ),
+  lexicon = "custom"
+)
+
+all_stop_words <- bind_rows(stop_words, custom_stop_words)
+
+# Prepare text for tokenisation
+word_data <- data_clean %>%
+  select(doc_id, class, text_raw) %>%
+  mutate(
+    text_for_words = str_to_lower(text_raw),
+    text_for_words = str_replace_all(text_for_words, "[’‘`]", "'")
+  ) %>%
+  unnest_tokens(word, text_for_words) %>%
+  mutate(
+    word = str_replace_all(word, "[^a-z]", "")
+  ) %>%
+  filter(word != "") %>%
+  filter(!str_detect(word, "^[0-9]+$")) %>%
+  filter(str_length(word) > 2) %>%
+  anti_join(all_stop_words, by = "word")
+
+# Count word frequency by class
+word_frequency <- word_data %>%
+  count(class, word, sort = TRUE)
+
+head(word_frequency, 10)
+```
+
+```{r top-words-by-class}
+top_words_by_class <- word_frequency %>%
+  group_by(class) %>%
+  slice_max(n, n = 20, with_ties = FALSE) %>%
+  ungroup()
+
+top_words_by_class
+```
+
+```{r top-words-plot}
+p_top_words <- ggplot(top_words_by_class, aes(x = reorder(word, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ class, scales = "free_y") +
+  labs(
+    title = "Top 20 Most Frequent Words by Post Category",
+    subtitle = "Common stop words, contractions, and obvious label words removed",
+    x = "Word",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+p_top_words
+
+save_figure(
+  p_top_words,
+  "top_words_by_class.png",
+  width = 9,
+  height = 5.5
+)
+```
+
+After removing common stop words, contractions, and obvious label words, the remaining terms provide a clearer view of broader linguistic patterns in the two post categories. These patterns are useful for exploratory understanding, but raw frequency alone is not sufficient for classification because it does not account for how distinctive a word is across categories.
+
+### TF-IDF Comparison by Class
+
+Raw word frequency shows common words in each class, but it does not show how distinctive a word is within individual posts. To obtain a more meaningful comparison, this section calculates TF-IDF at the individual post level and then summarises the average TF-IDF value of each word by post category.
+
+Because the dataset contains sensitive mental health-related language, offensive, highly sensitive, and unclear display terms are removed from the visualisation. The aim is to support responsible reporting while still showing interpretable linguistic patterns.
+
+```{r tfidf-analysis}
+# Count words within each individual post
+doc_word_counts <- word_data %>%
+  count(doc_id, class, word, name = "n")
+
+# Calculate TF-IDF at the post level
+doc_tfidf <- doc_word_counts %>%
+  bind_tf_idf(term = word, document = doc_id, n = n)
+
+# Summarise TF-IDF by class and word
+tfidf_by_class <- doc_tfidf %>%
+  group_by(class, word) %>%
+  summarise(
+    total_count = sum(n),
+    doc_count = n_distinct(doc_id),
+    mean_tfidf = mean(tf_idf),
+    .groups = "drop"
+  )
+```
+
+```{r tfidf-safe-filter}
+# Terms removed only from the displayed plot to avoid showing highly sensitive,
+# offensive, personal-name-like, or contextually unclear terms in the final visualisation.
+sensitive_display_terms <- c(
+  "raped", "slut", "retard", "incel", "chubby",
+  "fucking", "fuck", "cunts", "shit",
+  "weed", "druggy",
+  "slit", "noose",
+  "abortion",
+  "debbie", "katie", "kathy", "gabe", "manzo", "pero",
+  "bumble", "parfait",
+  "homoeopathy"
+)
+
+# Create a presentation-safe version.
+# Minimum count thresholds reduce the influence of rare or unclear terms.
+tfidf_words_safe <- tfidf_by_class %>%
+  filter(total_count >= 100) %>%
+  filter(doc_count >= 20) %>%
+  filter(!word %in% sensitive_display_terms)
+
+top_tfidf_words_safe <- tfidf_words_safe %>%
+  group_by(class) %>%
+  slice_max(mean_tfidf, n = 20, with_ties = FALSE) %>%
+  ungroup()
+
+top_tfidf_words_safe
+```
+
+```{r tfidf-plot}
+p_tfidf <- ggplot(top_tfidf_words_safe, aes(
+  x = reorder_within(word, mean_tfidf, class),
+  y = mean_tfidf
+)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ class, scales = "free") +
+  scale_x_reordered() +
+  labs(
+    title = "Top 20 Average TF-IDF Terms by Post Category",
+    subtitle = "Post-level TF-IDF with sensitive and unclear display terms removed",
+    x = "Word",
+    y = "Average TF-IDF"
+  ) +
+  theme_minimal()
+
+p_tfidf
+
+save_figure(
+  p_tfidf,
+  "tfidf_terms_by_class.png",
+  width = 9,
+  height = 5.5
+)
+```
+
+Post-level TF-IDF provides a more meaningful comparison than class-level TF-IDF because it treats each Reddit post as an individual document. This makes it easier to identify terms that are distinctive within posts from each category. ADHD comparison posts are expected to show terms related to medication, attention, diagnosis, and treatment experience, while depression-related posts are expected to show terms associated with emotional distress, social vulnerability, and negative life experiences.
+
+## Feature Engineering for Text Classification
+
+This section converts cleaned Reddit text into numerical features for machine learning. A Document-Term Matrix (DTM) is used to represent each post using word-frequency features. The train-test split is created before finalising the vocabulary, so the test set is transformed using only terms learned from the training data. This helps reduce data leakage.
+
+```{r feature-engineering}
+library(tm)
+library(SnowballC)
+
+set.seed(5145)
+
+# Prepare modelling data
+model_data <- data_clean[, c("text_raw", "label", "class", "word_count")]
+
+# Stratified train-test split
+train_indices <- unlist(
+  tapply(seq_len(nrow(model_data)), model_data$label, function(idx) {
+    sample(idx, size = floor(0.8 * length(idx)))
+  })
+)
+
+train_data <- model_data[train_indices, ]
+test_data <- model_data[-train_indices, ]
+
+# Text cleaning function for modelling
+clean_corpus <- function(text_vector) {
+  corpus <- VCorpus(VectorSource(text_vector))
+  
+  corpus <- tm_map(corpus, content_transformer(tolower))
+  
+  corpus <- tm_map(corpus, content_transformer(function(x) {
+    gsub("[’‘`]", "'", x)
+  }))
+  
+  corpus <- tm_map(corpus, removePunctuation)
+  corpus <- tm_map(corpus, removeNumbers)
+  
+  # Remove standard stop words and direct label-related terms
+  modelling_stop_words <- c(
+    stopwords("english"),
+    "adhd", "depression", "depressed", "depressive"
+  )
+  
+  corpus <- tm_map(corpus, removeWords, modelling_stop_words)
+  corpus <- tm_map(corpus, stemDocument)
+  corpus <- tm_map(corpus, stripWhitespace)
+  
+  corpus
+}
+
+# Create training corpus and DTM
+train_corpus <- clean_corpus(train_data$text_raw)
+
+train_dtm <- DocumentTermMatrix(
+  train_corpus,
+  control = list(wordLengths = c(3, Inf))
+)
+
+# Remove sparse terms to reduce noise and computational complexity
+train_dtm <- removeSparseTerms(train_dtm, 0.99)
+
+# Use the training vocabulary as the dictionary for the test set
+dtm_dictionary <- Terms(train_dtm)
+
+test_corpus <- clean_corpus(test_data$text_raw)
+
+test_dtm <- DocumentTermMatrix(
+  test_corpus,
+  control = list(dictionary = dtm_dictionary)
+)
+
+# Convert DTM objects to data frames
+train_matrix <- as.data.frame(as.matrix(train_dtm))
+test_matrix <- as.data.frame(as.matrix(test_dtm))
+
+# Make feature names syntactically valid for modelling
+feature_names <- make.names(colnames(train_matrix), unique = TRUE)
+colnames(train_matrix) <- feature_names
+colnames(test_matrix) <- feature_names
+
+# Add outcome labels
+train_matrix$label <- factor(
+  train_data$label,
+  levels = c(0, 1),
+  labels = c("ADHD", "Depression")
+)
+
+test_matrix$label <- factor(
+  test_data$label,
+  levels = c(0, 1),
+  labels = c("ADHD", "Depression")
+)
+
+# Create numeric labels for later evaluation
+test_actual_numeric <- ifelse(test_matrix$label == "Depression", 1, 0)
+
+# Summarise the feature engineering output
+feature_summary <- data.frame(
+  Item = c(
+    "Training posts",
+    "Testing posts",
+    "Number of DTM features",
+    "Training ADHD posts",
+    "Training depression-related posts",
+    "Testing ADHD posts",
+    "Testing depression-related posts"
+  ),
+  Value = c(
+    nrow(train_matrix),
+    nrow(test_matrix),
+    ncol(train_matrix) - 1,
+    sum(train_matrix$label == "ADHD"),
+    sum(train_matrix$label == "Depression"),
+    sum(test_matrix$label == "ADHD"),
+    sum(test_matrix$label == "Depression")
+  )
+)
+
+feature_summary
+```
+
+The DTM representation transforms unstructured Reddit text into structured word-frequency features. Sparse terms are removed to reduce noise, improve computational efficiency, and make the models easier to interpret. Direct label-related words such as "adhd" and "depression" are removed to reduce the risk that the model relies only on obvious category names.
+
+## Model Development
+
+This section trains two supervised text classification models: Logistic Regression and Naive Bayes. Logistic Regression is used as the main interpretable model because its coefficients can later be examined to understand which terms contribute to depression-related classification. Naive Bayes is used as a baseline model because it is commonly applied to text classification tasks.
+
+```{r model-development}
+library(e1071)
+library(pROC)
+
+# Separate predictors and labels
+train_x <- train_matrix[, setdiff(names(train_matrix), "label")]
+test_x <- test_matrix[, setdiff(names(test_matrix), "label")]
+
+train_y <- train_matrix$label
+test_y <- test_matrix$label
+
+# Logistic Regression model
+logistic_model <- glm(
+  label ~ .,
+  data = train_matrix,
+  family = binomial
+)
+
+# Predicted probabilities for the Depression class
+logistic_prob <- predict(
+  logistic_model,
+  newdata = test_matrix,
+  type = "response"
+)
+
+logistic_pred <- ifelse(logistic_prob >= 0.5, "Depression", "ADHD")
+logistic_pred <- factor(logistic_pred, levels = c("ADHD", "Depression"))
+
+# Naive Bayes model
+nb_model <- naiveBayes(
+  x = train_x,
+  y = train_y
+)
+
+nb_pred <- predict(
+  nb_model,
+  newdata = test_x,
+  type = "class"
+)
+
+nb_prob <- predict(
+  nb_model,
+  newdata = test_x,
+  type = "raw"
+)[, "Depression"]
+```
+
+Both models are trained using the same DTM features and the same train-test split. This makes their performance directly comparable.
+
+## Model Evaluation
+
+This section evaluates model performance using accuracy, precision, recall, F1-score, confusion matrix, ROC curve, and AUC. Since this project focuses on early-risk identification, recall is particularly important because false negatives may represent depression-related posts that are missed by the model.
+
+```{r evaluation-functions}
+# Evaluation function
+evaluate_model <- function(actual, predicted, positive_class = "Depression") {
+  actual <- factor(actual, levels = c("ADHD", "Depression"))
+  predicted <- factor(predicted, levels = c("ADHD", "Depression"))
+  
+  cm <- table(Predicted = predicted, Actual = actual)
+  
+  tp <- cm[positive_class, positive_class]
+  fp <- sum(cm[positive_class, ]) - tp
+  fn <- sum(cm[, positive_class]) - tp
+  tn <- sum(cm) - tp - fp - fn
+  
+  accuracy <- (tp + tn) / sum(cm)
+  precision <- tp / (tp + fp)
+  recall <- tp / (tp + fn)
+  f1 <- 2 * precision * recall / (precision + recall)
+  
+  list(
+    confusion_matrix = cm,
+    metrics = data.frame(
+      Accuracy = round(accuracy, 4),
+      Precision = round(precision, 4),
+      Recall = round(recall, 4),
+      F1 = round(f1, 4)
+    )
+  )
+}
+
+# Evaluate models
+logistic_eval <- evaluate_model(test_y, logistic_pred)
+nb_eval <- evaluate_model(test_y, nb_pred)
+
+logistic_eval$metrics
+nb_eval$metrics
+```
+
+```{r confusion-matrices}
+logistic_eval$confusion_matrix
+nb_eval$confusion_matrix
+```
+
+```{r model-comparison-table}
+model_comparison <- rbind(
+  data.frame(Model = "Logistic Regression", logistic_eval$metrics),
+  data.frame(Model = "Naive Bayes", nb_eval$metrics)
+)
+
+model_comparison
+```
+
+```{r model-comparison-plot}
+model_comparison_long <- model_comparison %>%
+  tidyr::pivot_longer(
+    cols = c("Accuracy", "Precision", "Recall", "F1"),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+p_model_comparison <- ggplot(model_comparison_long, aes(x = Metric, y = Value, fill = Model)) +
+  geom_col(position = "dodge") +
+  ylim(0, 1) +
+  labs(
+    title = "Model Performance Comparison",
+    x = "Evaluation Metric",
+    y = "Score"
+  ) +
+  theme_minimal()
+
+p_model_comparison
+
+save_figure(
+  p_model_comparison,
+  "model_performance_comparison.png",
+  width = 8,
+  height = 5
+)
+```
+
+The model comparison evaluates whether interpretable machine learning can distinguish depression-related posts from ADHD comparison posts. Accuracy alone is not sufficient for this project because the cost of false negatives may be higher in an early-risk triage setting.
+
+### ROC and AUC
+
+```{r roc-auc}
+# Convert actual labels to binary values for ROC analysis
+test_y_binary <- ifelse(test_y == "Depression", 1, 0)
+
+# ROC curves
+logistic_roc <- roc(test_y_binary, logistic_prob)
+nb_roc <- roc(test_y_binary, nb_prob)
+
+auc_summary <- data.frame(
+  Model = c("Logistic Regression", "Naive Bayes"),
+  AUC = c(
+    round(as.numeric(auc(logistic_roc)), 4),
+    round(as.numeric(auc(nb_roc)), 4)
+  )
+)
+
+auc_summary
+```
+
+```{r roc-plot}
+draw_roc_plot <- function() {
+  plot(
+    logistic_roc,
+    col = "black",
+    lwd = 2,
+    main = "ROC Curves for Text Classification Models"
+  )
+  
+  lines(
+    nb_roc,
+    col = "red",
+    lwd = 2
+  )
+  
+  legend(
+    "bottomright",
+    legend = c(
+      paste0("Logistic Regression, AUC = ", auc_summary$AUC[1]),
+      paste0("Naive Bayes, AUC = ", auc_summary$AUC[2])
+    ),
+    col = c("black", "red"),
+    lwd = 2
+  )
+}
+
+# Display in HTML
+draw_roc_plot()
+
+# Save to results/figures
+png(
+  filename = file.path(figures_dir, "roc_curves.png"),
+  width = 2400,
+  height = 1600,
+  res = 300
+)
+
+draw_roc_plot()
+
+dev.off()
+```
+
+ROC-AUC evaluates the model's ability to separate depression-related posts from ADHD comparison posts across different classification thresholds. A higher AUC indicates stronger discrimination ability.
+
+## Model Interpretability
+
+Logistic Regression is used as the main interpretable model because each coefficient indicates how strongly a term contributes to the prediction. Positive coefficients increase the log-odds of a post being classified as depression-related, while negative coefficients increase the likelihood of being classified as an ADHD comparison post.
+
+```{r logistic-coefficients}
+# Extract logistic regression coefficients
+coef_values <- coef(logistic_model)
+
+coef_df <- data.frame(
+  term = names(coef_values),
+  coefficient = as.numeric(coef_values)
+)
+
+# Remove intercept and non-finite values
+coef_df <- coef_df %>%
+  filter(term != "(Intercept)") %>%
+  filter(is.finite(coefficient)) %>%
+  mutate(
+    odds_ratio = exp(coefficient),
+    direction = ifelse(
+      coefficient > 0,
+      "More associated with Depression-related posts",
+      "More associated with ADHD comparison posts"
+    )
+  )
+
+# Top positive and negative coefficients
+top_depression_terms <- coef_df %>%
+  arrange(desc(coefficient)) %>%
+  slice_head(n = 20)
+
+top_adhd_terms <- coef_df %>%
+  arrange(coefficient) %>%
+  slice_head(n = 20)
+
+top_depression_terms
+top_adhd_terms
+```
+
+```{r coefficient-plot}
+coef_plot_data <- bind_rows(
+  top_depression_terms,
+  top_adhd_terms
+)
+
+p_coefficients <- ggplot(coef_plot_data, aes(
+  x = reorder(term, coefficient),
+  y = coefficient
+)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ direction, scales = "free") +
+  labs(
+    title = "Most Influential Terms in Logistic Regression",
+    subtitle = "Positive coefficients indicate depression-related posts; negative coefficients indicate ADHD comparison posts",
+    x = "Stemmed Term",
+    y = "Coefficient"
+  ) +
+  theme_minimal()
+
+p_coefficients
+
+save_figure(
+  p_coefficients,
+  "logistic_regression_coefficients.png",
+  width = 9,
+  height = 5.5
+)
+```
+
+The coefficient plot shows which terms contribute most strongly to the Logistic Regression model. This improves interpretability by making the model's decision patterns more transparent. However, these terms should be interpreted carefully because Reddit community labels are not equivalent to clinical diagnoses.
+
+## Error Analysis and Limitations
+
+Although Logistic Regression achieved strong overall performance, error analysis is important because this project is framed as an early-risk triage support system. False negatives may represent depression-related posts missed by the model, while false positives may increase the workload for human reviewers.
+
+```{r error-analysis}
+# Create prediction result table for Logistic Regression
+logistic_results <- data.frame(
+  actual = test_y,
+  predicted = logistic_pred,
+  probability_depression = logistic_prob,
+  word_count = test_data$word_count
+)
+
+logistic_results$error_type <- ifelse(
+  logistic_results$actual == logistic_results$predicted,
+  "Correct",
+  ifelse(
+    logistic_results$actual == "Depression" & logistic_results$predicted == "ADHD",
+    "False Negative",
+    "False Positive"
+  )
+)
+
+# Error summary
+error_summary <- logistic_results %>%
+  count(error_type) %>%
+  mutate(
+    percentage = round(n / sum(n) * 100, 2)
+  )
+
+error_summary
+```
+
+```{r error-summary-plot}
+p_error_summary <- ggplot(error_summary, aes(x = error_type, y = n)) +
+  geom_col() +
+  geom_text(
+    aes(label = paste0(n, " (", percentage, "%)")),
+    vjust = -0.4,
+    size = 3.5
+  ) +
+  labs(
+    title = "Prediction Error Summary for Logistic Regression",
+    x = "Prediction Outcome",
+    y = "Number of Posts"
+  ) +
+  theme_minimal()
+
+p_error_summary
+
+save_figure(
+  p_error_summary,
+  "prediction_error_summary.png",
+  width = 8,
+  height = 5
+)
+```
+
+```{r error-length-summary}
+# Compare text length across prediction outcomes
+error_length_summary <- logistic_results %>%
+  group_by(error_type) %>%
+  summarise(
+    count = n(),
+    median_word_count = median(word_count),
+    mean_word_count = round(mean(word_count), 2),
+    .groups = "drop"
+  )
+
+error_length_summary
+```
+
+```{r prediction-probability-plot}
+p_probability_distribution <- ggplot(logistic_results, aes(x = probability_depression, fill = actual)) +
+  geom_histogram(bins = 40, alpha = 0.7, position = "identity") +
+  labs(
+    title = "Distribution of Predicted Depression Probabilities",
+    x = "Predicted Probability of Depression-related Post",
+    y = "Number of Posts",
+    fill = "Actual Class"
+  ) +
+  theme_minimal()
+
+p_probability_distribution
+
+save_figure(
+  p_probability_distribution,
+  "predicted_depression_probability_distribution.png",
+  width = 8,
+  height = 5
+)
+```
+
+The error analysis shows how many posts were correctly classified and how many were false positives or false negatives. In this project, false negatives are especially important because they represent depression-related posts that the model failed to identify. However, false positives are also important because they may create unnecessary workload in a human-review triage workflow. Therefore, the model should be used as decision support rather than as an automated diagnostic system.
+
+## Summary of Demonstration Findings
+
+The R demonstration shows that Reddit mental health posts can be transformed into structured text features and used to classify depression-related posts against an ADHD comparison group. Exploratory analysis showed that the cleaned dataset contains 34,282 posts, with a moderate class imbalance between ADHD comparison posts and depression-related posts. Text length analysis showed that Reddit posts vary substantially in length, which supports the need for preprocessing and feature engineering.
+
+Word frequency and TF-IDF analysis revealed different linguistic patterns across the two post categories. ADHD comparison posts were more strongly associated with medication, attention, diagnosis, and executive-function-related terms. Depression-related posts were more associated with emotional distress, social vulnerability, negative experiences, and risk-related language.
+
+The modelling results showed that Logistic Regression achieved stronger overall performance than Naive Bayes, with higher accuracy, precision, F1-score, and AUC. Naive Bayes achieved slightly higher recall but produced more false positives. Logistic Regression was therefore selected as the main model because it provides both strong predictive performance and interpretable coefficients.
+
+The coefficient analysis showed that the model learned meaningful term-level patterns. However, the results should not be interpreted as clinical diagnosis. The dataset is based on subreddit categories rather than verified clinical labels, and model outputs should only be used as decision-support signals in a human-reviewed early-risk triage workflow.
+
+## Save Outputs
+
+This section saves key tables generated during the analysis into the project `results/tables` folder. These outputs make the project easier to reproduce, organise, and share as a portfolio project.
+
+```{r save-tables}
+# Helper function for saving tables only if the object exists
+save_table_if_exists <- function(object_name, file_name) {
+  if (exists(object_name)) {
+    object_value <- get(object_name)
+    
+    write.csv(
+      object_value,
+      file.path(tables_dir, file_name),
+      row.names = FALSE
+    )
+    
+    return(data.frame(
+      Object = object_name,
+      File = file_name,
+      Status = "Saved"
+    ))
+  } else {
+    return(data.frame(
+      Object = object_name,
+      File = file_name,
+      Status = "Object not found"
+    ))
+  }
+}
+
+# Save important analysis tables
+saved_tables <- rbind(
+  save_table_if_exists("cleaning_summary", "cleaning_summary.csv"),
+  save_table_if_exists("class_distribution", "class_distribution.csv"),
+  save_table_if_exists("text_length_summary", "text_length_summary.csv"),
+  save_table_if_exists("top_words_by_class", "top_words_by_class.csv"),
+  save_table_if_exists("top_tfidf_words_safe", "top_tfidf_words_safe.csv"),
+  save_table_if_exists("feature_summary", "feature_summary.csv"),
+  save_table_if_exists("model_comparison", "model_comparison.csv"),
+  save_table_if_exists("auc_summary", "auc_summary.csv"),
+  save_table_if_exists("error_summary", "error_summary.csv"),
+  save_table_if_exists("error_length_summary", "error_length_summary.csv"),
+  save_table_if_exists("top_depression_terms", "top_depression_terms.csv"),
+  save_table_if_exists("top_adhd_terms", "top_adhd_terms.csv")
+)
+
+saved_tables
+```
+```{r check-saved-figures}
+saved_figures <- list.files(
+  figures_dir,
+  pattern = "\\.png$",
+  full.names = FALSE
+)
+
+data.frame(
+  Saved_Figures = saved_figures
+)
+```
+```{r save-models}
+# Save trained models and DTM dictionary for reproducibility
+saveRDS(
+  logistic_model,
+  file.path(models_dir, "logistic_regression_model.rds")
+)
+
+saveRDS(
+  nb_model,
+  file.path(models_dir, "naive_bayes_model.rds")
+)
+
+saveRDS(
+  dtm_dictionary,
+  file.path(models_dir, "dtm_dictionary.rds")
+)
+
+saved_models <- list.files(
+  models_dir,
+  pattern = "\\.rds$",
+  full.names = FALSE
+)
+
+data.frame(
+  Saved_Models = saved_models
+)
+```
+
+
+
+
+
