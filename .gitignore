@@ -3,22 +3,26 @@
 .RData
 .RDataTmp
 .Rproj.user/
+notebooks/.Rhistory
 
 # R Markdown cache and generated files
 *_cache/
 *_files/
+notebooks/analysis_files/
 *.log
 *.tmp
 
 # Raw and sensitive data
 data/raw/
+data/adhd.csv
+data/depression.csv
 data/processed/data_clean_full.csv
 
 # Trained model files
 results/models/*.rds
 
-# Optional: large generated HTML files
-# notebooks/*.html
+# Local duplicate/working report drafts
+notebooks/SUNZHEN_36446874_Assignment3_report.Rmd
 
 # System files
 .DS_Store

@@ -883,7 +883,85 @@ draw_roc_plot()
 dev.off()
 ```
 
-ROC-AUC evaluates the model's ability to separate depression-related posts from ADHD comparison posts across different classification thresholds. A higher AUC indicates stronger discrimination ability.
+ROC-AUC evaluates the model's ability to separate depression-related posts from ADHD comparison posts across different classification thresholds. A higher AUC indicates stronger discrimination ability. This is useful for triage because the final decision threshold may need to change depending on reviewer capacity and the cost of missed high-risk posts.
+
+## Threshold-Based Triage Analysis
+
+The default model evaluation uses a probability threshold of 0.5. In a human-review triage workflow, this threshold should not be treated as fixed. A lower threshold may capture more depression-related posts, but it also creates a larger review queue. A higher threshold reduces reviewer workload, but it may miss more posts that should have been reviewed.
+
+```{r threshold-triage-analysis}
+threshold_values <- c(0.30, 0.40, 0.50, 0.60, 0.70)
+
+threshold_summary <- do.call(
+  rbind,
+  lapply(threshold_values, function(threshold) {
+    predicted <- ifelse(logistic_prob >= threshold, "Depression", "ADHD")
+    predicted <- factor(predicted, levels = c("ADHD", "Depression"))
+    
+    cm <- table(
+      Predicted = predicted,
+      Actual = test_y
+    )
+    
+    tp <- cm["Depression", "Depression"]
+    fp <- cm["Depression", "ADHD"]
+    fn <- cm["ADHD", "Depression"]
+    
+    precision <- tp / (tp + fp)
+    recall <- tp / (tp + fn)
+    f1 <- 2 * precision * recall / (precision + recall)
+    review_queue <- tp + fp
+    
+    data.frame(
+      Threshold = threshold,
+      Review_Queue_Posts = as.integer(review_queue),
+      Review_Queue_Percentage = round(review_queue / length(test_y) * 100, 2),
+      Precision = round(precision, 4),
+      Recall = round(recall, 4),
+      F1 = round(f1, 4),
+      False_Negatives = as.integer(fn),
+      False_Positives = as.integer(fp)
+    )
+  })
+)
+
+threshold_summary
+```
+
+```{r threshold-tradeoff-plot}
+threshold_summary_long <- threshold_summary %>%
+  tidyr::pivot_longer(
+    cols = c("Precision", "Recall", "F1"),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+p_threshold_tradeoff <- ggplot(
+  threshold_summary_long,
+  aes(x = Threshold, y = Value, colour = Metric)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Threshold Trade-off for Human Review Triage",
+    subtitle = "Lower thresholds improve recall but increase review workload",
+    x = "Depression Probability Threshold",
+    y = "Metric Score"
+  ) +
+  theme_minimal()
+
+p_threshold_tradeoff
+
+save_figure(
+  p_threshold_tradeoff,
+  "threshold_tradeoff.png",
+  width = 8,
+  height = 5
+)
+```
+
+The threshold analysis reframes the classifier as a triage support tool. If reviewer capacity is high, a lower threshold may be preferred because it reduces false negatives. If reviewer capacity is limited, a higher threshold may be necessary, but this should be chosen carefully because missed depression-related posts are the most serious error type in this project.
 
 ## Model Interpretability
 
@@ -1058,7 +1136,7 @@ The R demonstration shows that Reddit mental health posts can be transformed int
 
 Word frequency and TF-IDF analysis revealed different linguistic patterns across the two post categories. ADHD comparison posts were more strongly associated with medication, attention, diagnosis, and executive-function-related terms. Depression-related posts were more associated with emotional distress, social vulnerability, negative experiences, and risk-related language.
 
-The modelling results showed that Logistic Regression achieved stronger overall performance than Naive Bayes, with higher accuracy, precision, F1-score, and AUC. Naive Bayes achieved slightly higher recall but produced more false positives. Logistic Regression was therefore selected as the main model because it provides both strong predictive performance and interpretable coefficients.
+The modelling results showed that Logistic Regression achieved stronger overall performance than Naive Bayes, with higher accuracy, precision, F1-score, and AUC. Naive Bayes achieved slightly higher recall but produced more false positives. Logistic Regression was therefore selected as the main model because it provides both strong predictive performance and interpretable coefficients. The threshold-based triage analysis also shows that the model should not be deployed with an automatic fixed threshold; the threshold should be calibrated against reviewer capacity and the cost of false negatives.
 
 The coefficient analysis showed that the model learned meaningful term-level patterns. However, the results should not be interpreted as clinical diagnosis. The dataset is based on subreddit categories rather than verified clinical labels, and model outputs should only be used as decision-support signals in a human-reviewed early-risk triage workflow.
 
@@ -1102,6 +1180,7 @@ saved_tables <- rbind(
   save_table_if_exists("feature_summary", "feature_summary.csv"),
   save_table_if_exists("model_comparison", "model_comparison.csv"),
   save_table_if_exists("auc_summary", "auc_summary.csv"),
+  save_table_if_exists("threshold_summary", "threshold_summary.csv"),
   save_table_if_exists("error_summary", "error_summary.csv"),
   save_table_if_exists("error_length_summary", "error_length_summary.csv"),
   save_table_if_exists("top_depression_terms", "top_depression_terms.csv"),
